@@ -40,6 +40,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import random
 import sys
 import time
@@ -284,29 +285,41 @@ def _interactive(domain: str, phone: str = "", fun_flag: int = 1) -> int:
         return 1
 
     # 保存图片
+    # ★ 每次用【不同的文件名】：上一轮的看图程序会独占锁住旧文件，
+    #   同名写入会抛 OSError: [Errno 22] Invalid argument，把整个登录流程打断。
+    #   （这是实测踩到的坑）
     outdir = _SRC.parent / "state"
     outdir.mkdir(parents=True, exist_ok=True)
-    png = outdir / "captcha.png"
-    png.write_bytes(base64.b64decode(img))
+    png = outdir / f"captcha_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.png"
+    try:
+        png.write_bytes(base64.b64decode(img))
+    except Exception as exc:
+        print(f"  ⚠ 验证码图片保存失败（{type(exc).__name__}），改为纯手动输入")
+        png = None
 
     captcha = ""
     # 优先用本地 OCR（若装了 ddddocr）
-    try:
-        import ddddocr  # type: ignore
-        ocr = ddddocr.DdddOcr(show_ad=False)
-        captcha = ocr.classification(png.read_bytes())
-        print(f"\n  🤖 本地 OCR 识别：{captcha}")
-    except ImportError:
-        pass
+    # ★ 不能只 catch ImportError：ddddocr 依赖 onnxruntime，
+    #   缺 DLL 时抛的是 OSError，之前正是它把登录打断了
+    if png is not None:
+        try:
+            import ddddocr  # type: ignore
+            ocr = ddddocr.DdddOcr(show_ad=False)
+            captcha = ocr.classification(png.read_bytes())
+            print(f"\n  🤖 本地 OCR 识别：{captcha}")
+        except Exception as exc:
+            print(f"\n  （本地 OCR 不可用：{type(exc).__name__}，改为手动输入）")
 
     if not captcha:
         # ★ 自动弹出图片，用户照抄即可（和小程序里一样的体验）
-        print(f"\n  即将打开验证码图片，请照着上面的字符输入：\n    {png}")
-        try:
-            import os
-            os.startfile(str(png))
-        except Exception as exc:
-            print(f"  （自动打开失败：{exc}，请手动打开上面这个文件）")
+        if png is not None:
+            print(f"\n  即将打开验证码图片，请照着上面的字符输入：\n    {png}")
+            try:
+                os.startfile(str(png))
+            except Exception as exc:
+                print(f"  （自动打开失败：{type(exc).__name__}，请手动打开上面这个文件）")
+        else:
+            print("\n  验证码图片没能保存，请另想办法看图（比如截图发给自己）")
 
     shown = captcha or input("  请输入图片里的字符（直接回车可重取）: ").strip()
     if not shown:
@@ -317,12 +330,31 @@ def _interactive(domain: str, phone: str = "", fun_flag: int = 1) -> int:
     ok, msg = lg.send_sms(phone, shown, fun_flag)
     print(f"  {'✅' if ok else '✗'} {msg}")
     if not ok:
-        print("  （验证码有效期很短，失败通常是输入超时；重新运行即可）")
+        print("  （验证码有效期很短，大约 1 分钟；看到图片就快点输）")
         return 1
 
     import getpass
-    pw = getpass.getpass("  登录密码（不回显、不保存）: ")
+    saved_phone, pw = "", ""
+    try:
+        import credentials
+        saved_phone, pw = credentials.load()
+    except Exception:
+        pass
+
+    if saved_phone == phone and pw:
+        print(f"  （使用本机已加密保存的密码，长度 {len(pw)} 位）")
+    else:
+        pw = getpass.getpass("  登录密码（不回显）: ")
+        # 只打印长度，不打印内容——万一输入被终端搞乱了，这里能立刻看出来
+        print(f"  （已读取密码，长度 {len(pw)} 位）")
+    if len(pw) < 6:
+        print("  ✗ 密码太短（学校要求 6-18 位），可能输入没被读到，请重试")
+        return 1
     code = input("  短信验证码: ").strip()
+    print(f"  （已读取短信码，长度 {len(code)} 位）")
+    if not code:
+        print("  ✗ 短信验证码为空")
+        return 1
 
     ok, msg, info = lg.login(phone, pw, code)
     print(f"\n  {'🎉' if ok else '✗'} {msg}")
@@ -330,7 +362,35 @@ def _interactive(domain: str, phone: str = "", fun_flag: int = 1) -> int:
         from config import save_token, token_hash
         save_token(info["token"])
         print(f"  票据已保存，会话 {token_hash(info['token'])[:8]}…")
+
+        # 问一下要不要把账号密码加密存本机 → 以后票据过期能自动重登
+        if saved_phone != phone:
+            print("""
+  要不要把账号密码存在本机（Windows DPAPI 加密，只有你这台电脑+这个账户能解开）？
+  好处：以后票据过期时能自动重新登录，你只需在极少数情况下输一次短信码。
+  不想存就选 n；随时可以用 `python src/credentials.py --clear` 删掉。""")
+            ans = input("  保存吗？(y/N): ").strip().lower()
+            if ans.startswith("y"):
+                try:
+                    import credentials
+                    credentials.save(phone, pw)
+                    print(f"  ✅ {credentials.describe()}")
+                except Exception as exc:
+                    print(f"  ⚠ 保存失败：{type(exc).__name__}: {exc}")
         return 0
+
+    # 失败时给人话解释
+    if "-45" in msg and "验证码" in msg:
+        print("""
+  ── 这是什么意思 ──
+  服务器说【短信验证码】不对。常见原因：
+    · 输入太慢，短信码已过期（有效期通常 5 分钟）→ 重来一次，收到就立刻输
+    · 手机上收到了好几条短信，用了旧的那条 → 用【最新】那条
+    · 看错数字 → 重来一次
+  注意：这一步失败跟你的密码无关，也跟图片验证码无关。
+""")
+    elif "密码" in msg:
+        print("  ── 密码不对，确认一下大小写 ──")
     return 1
 
 
